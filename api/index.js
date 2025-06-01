@@ -30,7 +30,13 @@ async function connectRabbitMQ() {
   try {
     const conn = await amqp.connect(RABBITMQ_URL);
     rabbitChannel = await conn.createChannel();
-    await rabbitChannel.assertQueue(QUEUE_NAME, { durable: true });
+    await rabbitChannel.assertQueue(QUEUE_NAME, {
+      durable: true,
+      arguments: {
+        "x-message-ttl": 3600000, // Messages expire after 1 hour
+        "x-max-length": 1000, // Maximum queue size
+      },
+    });
     logger.info("Connected to RabbitMQ");
   } catch (err) {
     logger.error("RabbitMQ connection error:", err);
@@ -121,16 +127,37 @@ app.get("/download/:id", async (req, res) => {
   }
 });
 
-// MongoDB connection
-mongoose
-  .connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-  .then(() => {
-    logger.info("Connected to MongoDB");
-    app.listen(PORT, () => {
-      logger.info(`API server running on port ${PORT}`);
-    });
-  })
-  .catch((err) => {
-    logger.error("MongoDB connection error:", err);
-    process.exit(1);
+async function startServer() {
+  await mongoose.connect(MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
   });
+  logger.info("Connected to MongoDB");
+
+  // Connect to RabbitMQ
+  const conn = await amqp.connect(RABBITMQ_URL);
+  const channel = await conn.createChannel();
+
+  try {
+    // Try to delete the queue if it exists
+    await channel.deleteQueue(QUEUE_NAME);
+    logger.info(`Deleted existing queue ${QUEUE_NAME}`);
+  } catch (error) {
+    logger.info(`Queue ${QUEUE_NAME} does not exist or could not be deleted`);
+  }
+
+  // Create queue with our desired settings
+  await channel.assertQueue(QUEUE_NAME, {
+    durable: true,
+    arguments: {
+      "x-message-ttl": 3600000, // Messages expire after 1 hour
+      "x-max-length": 1000, // Maximum queue size
+    },
+  });
+
+  app.listen(PORT, () => {
+    logger.info(`API server running on port ${PORT}`);
+  });
+}
+
+startServer();

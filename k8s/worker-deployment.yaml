@@ -14,13 +14,15 @@ spec:
     spec:
       containers:
         - name: worker
-          image: worker:latest # Replace with actual image name after building
+          image: worker:latest
+          imagePullPolicy: IfNotPresent
           env:
             - name: MONGO_URI
-              value: "mongodb://mongo:27017/crawler"
+              value: mongodb://mongo:27017/crawler
             - name: RABBITMQ_URL
-              value: "amqp://rabbitmq"
-          imagePullPolicy: IfNotPresent
+              value: amqp://rabbitmq
+            - name: ELASTICSEARCH_URL
+              value: http://elasticsearch:9200
           volumeMounts:
             - name: results-volume
               mountPath: /app/results

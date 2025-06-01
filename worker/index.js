@@ -1,23 +1,18 @@
 const amqp = require("amqplib");
 const mongoose = require("mongoose");
-const winston = require("winston");
 const axios = require("axios");
 const cheerio = require("cheerio");
 const archiver = require("archiver");
 const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
+const cluster = require("cluster");
+const logger = require("./logger");
+const numCPUs = 2; // Exactly 2 crawling processes
 
 const RABBITMQ_URL = process.env.RABBITMQ_URL || "amqp://localhost";
 const QUEUE_NAME = "crawl_jobs";
 const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/crawler";
-
-// Logger setup
-const logger = winston.createLogger({
-  level: "info",
-  format: winston.format.json(),
-  transports: [new winston.transports.Console()],
-});
 
 // Mongoose schema and model
 const crawlJobSchema = new mongoose.Schema(
@@ -41,7 +36,37 @@ class Crawler {
     this.visitedUrls = new Set();
     this.resourceUrls = new Set();
     this.pendingUrls = new Set([baseUrl]);
+    this.headers = {
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Accept-Encoding": "gzip, deflate, br",
+      Connection: "keep-alive",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-User": "?1",
+      "Cache-Control": "max-age=0",
+    };
     logger.info(`Starting crawler for ${baseUrl} in directory ${jobDir}`);
+  }
+
+  getFilePath(urlObj, isHtml = true) {
+    let pathname = urlObj.pathname;
+
+    // Handle trailing slash
+    if (pathname.endsWith("/")) {
+      pathname = pathname + "index.html";
+    }
+    // Add .html extension if no extension is present and it's an HTML file
+    else if (isHtml && !pathname.includes(".")) {
+      pathname = pathname + ".html";
+    }
+
+    return path.join(this.jobDir, pathname);
   }
 
   async crawl() {
@@ -59,15 +84,15 @@ class Crawler {
 
       try {
         const response = await axios.get(url, {
+          headers: this.headers,
           maxRedirects: 5,
           validateStatus: (status) => status < 400,
+          timeout: 10000, // 10 second timeout
         });
 
         const $ = cheerio.load(response.data);
         const urlObj = new URL(url);
-        const relativePath =
-          urlObj.pathname === "/" ? "/index.html" : urlObj.pathname;
-        const filePath = path.join(this.jobDir, relativePath);
+        const filePath = this.getFilePath(urlObj);
 
         logger.info(`Saving HTML to: ${filePath}`);
         // Ensure directory exists
@@ -84,7 +109,13 @@ class Crawler {
         this.extractLinks($, urlObj);
         logger.info(`Current pending URLs: ${this.pendingUrls.size}`);
       } catch (error) {
-        logger.error(`Error crawling ${url}:`, error.message);
+        logger.error(`Error crawling ${url}:`, {
+          message: error.message,
+          code: error.code,
+          status: error.response?.status,
+          statusText: error.response?.statusText,
+          headers: error.response?.headers,
+        });
       }
     }
     logger.info(
@@ -132,14 +163,15 @@ class Crawler {
 
       try {
         const response = await axios.get(resourceUrl, {
+          headers: this.headers,
           responseType: "arraybuffer",
           maxRedirects: 5,
           validateStatus: (status) => status < 400,
+          timeout: 10000, // 10 second timeout
         });
 
         const urlObj = new URL(resourceUrl);
-        const relativePath = urlObj.pathname;
-        const filePath = path.join(this.jobDir, relativePath);
+        const filePath = this.getFilePath(urlObj, false);
 
         logger.info(`Saving resource to: ${filePath}`);
         // Ensure directory exists
@@ -149,10 +181,12 @@ class Crawler {
         fs.writeFileSync(filePath, response.data);
         logger.info(`Successfully saved resource: ${resourceUrl}`);
       } catch (error) {
-        logger.error(
-          `Error downloading resource ${resourceUrl}:`,
-          error.message
-        );
+        logger.error(`Error downloading resource ${resourceUrl}:`, {
+          message: error.message,
+          code: error.code,
+          status: error.response?.status,
+          statusText: error.response?.statusText,
+        });
       }
     }
   }
@@ -252,26 +286,123 @@ async function startWorker() {
     useNewUrlParser: true,
     useUnifiedTopology: true,
   });
-  logger.info("Worker connected to MongoDB");
+  logger.info(`Worker ${process.pid} connected to MongoDB`);
 
   const conn = await amqp.connect(RABBITMQ_URL);
   const channel = await conn.createChannel();
-  await channel.assertQueue(QUEUE_NAME, { durable: true });
-  logger.info("Worker connected to RabbitMQ, waiting for jobs...");
 
-  channel.consume(QUEUE_NAME, async (msg) => {
-    if (msg !== null) {
-      const jobData = JSON.parse(msg.content.toString());
-      logger.info(`Received job: ${JSON.stringify(jobData)}`);
-      // Update job status to 'processing'
-      await CrawlJob.findByIdAndUpdate(jobData.id, { status: "processing" });
-      await crawlAndZip(jobData);
-      channel.ack(msg);
+  try {
+    // Try to create queue with our desired settings
+    await channel.assertQueue(QUEUE_NAME, {
+      durable: true,
+      arguments: {
+        "x-message-ttl": 3600000, // Messages expire after 1 hour
+        "x-max-length": 1000, // Maximum queue size
+      },
+    });
+    logger.info(
+      `Worker ${process.pid} connected to RabbitMQ queue ${QUEUE_NAME}`
+    );
+  } catch (error) {
+    logger.error(`Worker ${process.pid} error setting up queue:`, error);
+    // Don't exit, try to use existing queue
+    try {
+      await channel.checkQueue(QUEUE_NAME);
+      logger.info(`Worker ${process.pid} using existing queue ${QUEUE_NAME}`);
+    } catch (err) {
+      logger.error(
+        `Worker ${process.pid} fatal error: queue ${QUEUE_NAME} not available`
+      );
+      process.exit(1);
     }
+  }
+
+  // Set prefetch count to 1 to ensure fair distribution between workers
+  await channel.prefetch(1);
+
+  logger.info(`Worker ${process.pid} waiting for jobs...`);
+
+  channel.consume(
+    QUEUE_NAME,
+    async (msg) => {
+      if (msg !== null) {
+        logger.info(
+          `Worker ${
+            process.pid
+          } received raw message: ${msg.content.toString()}`
+        );
+        const jobData = JSON.parse(msg.content.toString());
+        logger.info(
+          `Worker ${process.pid} parsed job: ${JSON.stringify(jobData)}`
+        );
+
+        try {
+          logger.info(
+            `Worker ${process.pid} updating job ${jobData.id} status to processing`
+          );
+          await CrawlJob.findByIdAndUpdate(jobData.id, {
+            status: "processing",
+          });
+
+          logger.info(
+            `Worker ${process.pid} starting crawl for job ${jobData.id}`
+          );
+          await crawlAndZip(jobData);
+
+          channel.ack(msg);
+          logger.info(`Worker ${process.pid} completed job: ${jobData.id}`);
+        } catch (error) {
+          logger.error(
+            `Worker ${process.pid} error processing job ${jobData.id}:`,
+            {
+              error: error.message,
+              stack: error.stack,
+            }
+          );
+          channel.nack(msg, false, false); // Don't requeue on error
+          await CrawlJob.findByIdAndUpdate(jobData.id, { status: "error" });
+        }
+      } else {
+        logger.warn(`Worker ${process.pid} received null message`);
+      }
+    },
+    {
+      noAck: false, // Explicitly set noAck to false to ensure manual acknowledgment
+    }
+  );
+
+  // Handle channel errors
+  channel.on("error", (err) => {
+    logger.error(`Worker ${process.pid} channel error:`, err);
+  });
+
+  // Handle connection errors
+  conn.on("error", (err) => {
+    logger.error(`Worker ${process.pid} connection error:`, err);
   });
 }
 
-startWorker().catch((err) => {
-  logger.error("Worker error:", err);
-  process.exit(1);
-});
+if (cluster.isMaster) {
+  logger.info(`Master ${process.pid} is running`);
+
+  // Fork workers
+  for (let i = 0; i < numCPUs; i++) {
+    cluster.fork();
+  }
+
+  cluster.on("exit", (worker, code, signal) => {
+    logger.warn(`Worker ${worker.process.pid} died. Restarting...`);
+    cluster.fork();
+  });
+
+  // Log when a worker starts
+  cluster.on("online", (worker) => {
+    logger.info(`Worker ${worker.process.pid} is online`);
+  });
+} else {
+  // Workers can share any TCP connection
+  startWorker().catch((err) => {
+    logger.error(`Worker ${process.pid} error:`, err);
+    process.exit(1);
+  });
+}
